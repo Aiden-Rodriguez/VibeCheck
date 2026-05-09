@@ -1,6 +1,9 @@
+#From : https://www.youtube.com/watch?v=1lN4L74BwWo
+
 import cv2
 import mediapipe as mp
 import time
+
 
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
