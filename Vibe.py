@@ -61,7 +61,6 @@ def detect_gesture(landmarks, handedness="Right"):
 
     return f"{count} fingers"
 
-s
 def main():
     base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
 
