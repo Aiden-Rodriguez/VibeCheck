@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -7,142 +8,525 @@ cap = cv2.VideoCapture(0)
 cap.set(3, 1280)
 cap.set(4, 720)
 
+# Constants
+
 HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),        # thumb
-    (0, 5), (5, 6), (6, 7), (7, 8),        # index
-    (5, 9), (9, 10), (10, 11), (11, 12),   # middle
-    (9, 13), (13, 14), (14, 15), (15, 16), # ring
-    (13, 17), (17, 18), (18, 19), (19, 20),# pinky
-    (0, 17)                                # palm
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
 ]
 
-FINGERTIPS = {
-    4: "thumb",
-    8: "index",
-    12: "middle",
-    16: "ring",
-    20: "pinky",
+FINGERTIPS = {4: "thumb", 8: "index", 12: "middle", 16: "ring", 20: "pinky"}
+
+FACE_KEY_POINTS = {
+    33: "L_eye_outer", 133: "L_eye_inner",
+    362: "R_eye_outer", 263: "R_eye_inner",
+    159: "L_eye_top",   145: "L_eye_bot",
+    386: "R_eye_top",   374: "R_eye_bot",
+    70:  "L_brow",      300: "R_brow",
+    1:   "nose_tip",    4:   "nose_base",
+    61:  "L_lip",       291: "R_lip",
+    0:   "lip_top",     17:  "lip_bot",
+    10:  "forehead",    152: "chin",
+    234: "L_cheek",     454: "R_cheek",
 }
 
+FACE_FEATURE_CONNECTIONS = {
+    "left_eye":  [33, 160, 158, 133, 153, 144, 33],
+    "right_eye": [362, 385, 387, 263, 373, 380, 362],
+    "left_brow": [46, 53, 52, 65, 55],
+    "right_brow":[285, 295, 282, 283, 276],
+    "outer_lips":[61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
+                  375, 321, 405, 314, 17, 84, 181, 91, 146, 61],
+    "inner_lips":[78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308,
+                  324, 318, 402, 317, 14, 87, 178, 88, 95, 78],
+    "nose":      [168, 6, 197, 195, 5, 4, 1, 19, 94],
+}
+
+FEATURE_COLORS = {
+    "left_eye":   (0, 255, 255),
+    "right_eye":  (0, 255, 255),
+    "left_brow":  (255, 200, 0),
+    "right_brow": (255, 200, 0),
+    "outer_lips": (0, 80, 255),
+    "inner_lips": (0, 140, 255),
+    "nose":       (180, 255, 100),
+}
+
+GESTURE_IMAGES = {
+    "Absolute Cinema": "images/AbsoluteCinema.png",
+    "Erm":             "images/ErmDog.jpg",
+    "MonkeyThink":     "images/ThinkingMonkey.jpeg",
+    "NaNaNaNaNaNa":    "images/NaNaNaNaNaNa.jpg",
+    "Drinking":        "images/beerguy.jpg",
+}
+
+
+# Image helpers
+
+def load_gesture_images():
+    cache = {}
+    for gesture, path in GESTURE_IMAGES.items():
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            cache[gesture] = img
+        else:
+            print(f"[WARN] Could not load gesture image: {path}")
+    return cache
+
+
+def draw_gesture_preview(frame, gesture_name, image_cache, size=180):
+    if gesture_name not in image_cache:
+        return
+    fh, fw = frame.shape[:2]
+    thumb   = cv2.resize(image_cache[gesture_name], (size, size))
+    margin  = 12
+    x_off   = fw - size - margin
+    y_off   = fh - size - margin
+    roi     = frame[y_off:y_off + size, x_off:x_off + size]
+
+    if thumb.shape[2] == 4:
+        alpha   = thumb[:, :, 3:4] / 255.0
+        blended = (thumb[:, :, :3] * alpha + roi * (1 - alpha)).astype("uint8")
+    else:
+        blended = thumb
+
+    frame[y_off:y_off + size, x_off:x_off + size] = blended
+    cv2.rectangle(frame, (x_off - 1, y_off - 1),
+                  (x_off + size, y_off + size), (255, 255, 255), 1)
+    cv2.putText(frame, gesture_name, (x_off, y_off - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+
+# This currently doesnt work for palm detection so it currently works if palm
+# is facing camera and when it the other way around
+
+def palm_normal(landmarks):
+    """
+    Compute the palm surface normal using two edge vectors of the palm quad:
+      wrist(0) → index_mcp(5)  and  wrist(0) → pinky_mcp(17)
+    The cross product gives a vector perpendicular to the palm.
+    A positive z-component means the normal points toward the camera
+    (palm facing camera); negative means the back of the hand faces camera.
+    MediaPipe x/y are normalised [0,1]; z is in the same scale so the
+    cross-product sign is reliable even though the magnitude is not.
+    """
+    def v(lm): return np.array([lm.x, lm.y, lm.z])
+
+    wrist     = v(landmarks[0])
+    idx_mcp   = v(landmarks[5])
+    pinky_mcp = v(landmarks[17])
+
+    vec_a = idx_mcp   - wrist   # wrist → index knuckle
+    vec_b = pinky_mcp - wrist   # wrist → pinky knuckle
+
+    normal = np.cross(vec_a, vec_b)
+    return normal
+
+
+def is_palm_facing_camera(landmarks):
+    """
+    Returns True when the palm faces the camera.
+    The normal's z-component sign tells us: in MediaPipe's coordinate
+    system (y points DOWN), a palm-forward pose gives a normal with
+    positive z.  After the image is flipped horizontally (cv2.flip)
+    left/right swap but z remains the same convention.
+    """
+    normal = palm_normal(landmarks)
+    return normal[2] > 0          # positive z → palm toward camera
+
+
+def is_palm_facing_away(landmarks):
+    normal = palm_normal(landmarks)
+    return normal[2] < 0          # negative z → back of hand toward camera
+
+
+# Finger/Hand state
 
 def finger_is_up(landmarks, tip, pip):
     return landmarks[tip].y < landmarks[pip].y
 
 
+def is_palm_open(landmarks):
+    return all([
+        finger_is_up(landmarks, 8,  6),
+        finger_is_up(landmarks, 12, 10),
+        finger_is_up(landmarks, 16, 14),
+        finger_is_up(landmarks, 20, 18),
+    ])
+
+
+def thumb_is_extended(landmarks, handedness):
+    """Thumb spread sideways (not curled into the palm)."""
+    tip  = landmarks[4]
+    base = landmarks[2]
+    if handedness == "Right":
+        return tip.x < base.x
+    else:
+        return tip.x > base.x
+
+
+# Face geometry
+
+def get_face_bbox(face_landmarks, w, h, padding=0.05):
+    xs = [lm.x for lm in face_landmarks]
+    ys = [lm.y for lm in face_landmarks]
+    return (
+        int(min(xs) * w - padding * w),
+        int(min(ys) * h - padding * h),
+        int(max(xs) * w + padding * w),
+        int(max(ys) * h + padding * h),
+    )
+
+
+def get_lip_bbox(face_landmarks, w, h, padding=0.03):
+    """
+    Tight bounding box around the lip region using outer-lip landmark indices.
+    """
+    lip_indices = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
+                   375, 321, 405, 314, 17, 84, 181, 91, 146]
+    xs = [face_landmarks[i].x for i in lip_indices]
+    ys = [face_landmarks[i].y for i in lip_indices]
+    return (
+        int(min(xs) * w - padding * w),
+        int(min(ys) * h - padding * h),
+        int(max(xs) * w + padding * w),
+        int(max(ys) * h + padding * h),
+    )
+
+
+def get_ear_region(face_landmarks, w, h, side="left"):
+    """
+    Approximate ear/temple region for NaNaNaNaNaNa detection.
+    'left'  uses left cheek / temple landmarks (234, 127, 162, 21)
+    'right' uses right cheek / temple landmarks (454, 356, 389, 251)
+    Returns (x_min, y_min, x_max, y_max) with generous padding.
+    """
+    if side == "left":
+        indices = [234, 127, 162, 21]
+    else:
+        indices = [454, 356, 389, 251]
+
+    xs = [face_landmarks[i].x for i in indices]
+    ys = [face_landmarks[i].y for i in indices]
+    pad = 0.10
+    return (
+        int((min(xs) - pad) * w),
+        int((min(ys) - pad) * h),
+        int((max(xs) + pad) * w),
+        int((max(ys) + pad) * h),
+    )
+
+
+def landmark_in_bbox(lm, w, h, bbox):
+    px, py = int(lm.x * w), int(lm.y * h)
+    x0, y0, x1, y1 = bbox
+    return x0 <= px <= x1 and y0 <= py <= y1
+
+
+def index_tip_in_bbox(hand_landmarks, w, h, bbox):
+    return landmark_in_bbox(hand_landmarks[8], w, h, bbox)
+
+
+def thumb_tip_in_bbox(hand_landmarks, w, h, bbox):
+    return landmark_in_bbox(hand_landmarks[4], w, h, bbox)
+
+
+# Per-hand gesture 
+
 def detect_gesture(landmarks, handedness="Right"):
     thumb_tip = landmarks[4]
-    thumb_ip = landmarks[3]
+    thumb_ip  = landmarks[3]
+    thumb_up  = (thumb_tip.x > thumb_ip.x if handedness == "Right"
+                 else thumb_tip.x < thumb_ip.x)
 
-    if handedness == "Right":
-        thumb_up = thumb_tip.x > thumb_ip.x
-    else:
-        thumb_up = thumb_tip.x < thumb_ip.x
-
-    index_up = finger_is_up(landmarks, 8, 6)
+    index_up  = finger_is_up(landmarks, 8,  6)
     middle_up = finger_is_up(landmarks, 12, 10)
-    ring_up = finger_is_up(landmarks, 16, 14)
-    pinky_up = finger_is_up(landmarks, 20, 18)
+    ring_up   = finger_is_up(landmarks, 16, 14)
+    pinky_up  = finger_is_up(landmarks, 20, 18)
+    thumb_ext = thumb_is_extended(landmarks, handedness)
 
     fingers = [thumb_up, index_up, middle_up, ring_up, pinky_up]
-    count = fingers.count(True)
+    count   = fingers.count(True)
 
-    if count == 0:
-        return "Fist"
-    if count == 5:
-        return "Open Hand"
-    if index_up and middle_up and not ring_up and not pinky_up:
-        return "Peace"
-    if thumb_up and not index_up and not middle_up and not ring_up and not pinky_up:
-        return "Thumbs Up"
-    if index_up and not middle_up and not ring_up and not pinky_up:
-        return "Pointing"
-    if thumb_up and pinky_up and not index_up and not middle_up and not ring_up:
-        return "Call Me"
+    # Drinking: pinky up, thumb extended, other fingers curled
+    # (thumb near mouth checked in caller with face data)
+    if pinky_up and not index_up and not middle_up and not ring_up:
+        return "Drinking_candidate"
+
+    # Erm: index up + thumb visibly extended, others curled
+    if index_up and thumb_ext and not middle_up and not ring_up and not pinky_up:
+        return "Erm"
+
+    if index_up and not any([middle_up, ring_up, pinky_up]):             return "Pointing"
 
     return f"{count} fingers"
 
-def main():
-    base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
 
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options,
+# Two-hand gestures
+
+def detect_two_hand_gesture(hand_landmarks_list, handedness_list, face_landmarks_list, w, h):
+    if len(hand_landmarks_list) < 2:
+        return None
+
+    lms_a, lms_b = hand_landmarks_list[0], hand_landmarks_list[1]
+
+    thumb_near_head = False
+
+    if is_palm_open(lms_a) and is_palm_open(lms_b):
+        if face_landmarks_list:
+            face = face_landmarks_list[0]
+            left_ear  = get_ear_region(face, w, h, "left")
+            right_ear = get_ear_region(face, w, h, "right")
+
+            hand_a_near = (thumb_tip_in_bbox(lms_a, w, h, left_ear) or
+                           thumb_tip_in_bbox(lms_a, w, h, right_ear))
+            hand_b_near = (thumb_tip_in_bbox(lms_b, w, h, left_ear) or
+                           thumb_tip_in_bbox(lms_b, w, h, right_ear))
+
+            thumb_near_head = hand_a_near and hand_b_near
+
+        if thumb_near_head:
+            return "NaNaNaNaNaNa"
+        else:
+            return "Absolute Cinema"
+
+    return None
+
+
+# Face drawing
+
+def draw_face_landmarks(frame, face_landmarks, w, h):
+    pts = {i: (int(lm.x * w), int(lm.y * h)) for i, lm in enumerate(face_landmarks)}
+
+    for feature, indices in FACE_FEATURE_CONNECTIONS.items():
+        color = FEATURE_COLORS[feature]
+        poly  = [pts[i] for i in indices if i in pts]
+        for j in range(len(poly) - 1):
+            cv2.line(frame, poly[j], poly[j + 1], color, 1)
+
+    for idx, label in FACE_KEY_POINTS.items():
+        if idx not in pts:
+            continue
+        x, y = pts[idx]
+        cv2.circle(frame, (x, y), 3, (255, 255, 255), -1)
+        cv2.putText(frame, label, (x + 4, y - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
+
+    return pts
+
+
+def estimate_head_pose(pts, w, h):
+    if not all(k in pts for k in [1, 234, 454]):
+        return None
+    nose_x        = pts[1][0]
+    l_cheek_x     = pts[234][0]
+    r_cheek_x     = pts[454][0]
+    face_center_x = (l_cheek_x + r_cheek_x) / 2
+    offset        = nose_x - face_center_x
+    threshold     = (r_cheek_x - l_cheek_x) * 0.1
+
+    if offset < -threshold: return "Looking Left"
+    if offset >  threshold: return "Looking Right"
+    return "Looking Center"
+
+
+# HUD 
+
+def draw_hud_hint(frame, show_skeleton):
+    fh, fw = frame.shape[:2]
+    state  = "ON" if show_skeleton else "OFF"
+    color  = (0, 255, 100) if show_skeleton else (0, 80, 255)
+    text   = f"[S] Skeleton: {state}"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.putText(frame, text, (fw - tw - 10, th + 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+
+def draw_banner(frame, text, color=(0, 215, 255)):
+    fh, fw = frame.shape[:2]
+    (bw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.4, 3)
+    bx = (fw - bw) // 2
+    by = 70
+    cv2.putText(frame, text, (bx + 2, by + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 4)
+    cv2.putText(frame, text, (bx, by),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3)
+
+
+# Main
+
+def main():
+    gesture_images = load_gesture_images()
+    show_skeleton  = True
+
+    hand_options = vision.HandLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path="hand_landmarker.task"),
         num_hands=2,
         min_hand_detection_confidence=0.7,
-        min_tracking_confidence=0.5
+        min_tracking_confidence=0.5,
+    )
+    face_options = vision.FaceLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path="face_landmarker.task"),
+        output_face_blendshapes=True,
+        num_faces=2,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
 
-    with vision.HandLandmarker.create_from_options(options) as landmarker:
+    with (vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker,
+          vision.FaceLandmarker.create_from_options(face_options) as face_landmarker):
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame = cv2.flip(frame, 1)
-            h, w, _ = frame.shape
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame    = cv2.flip(frame, 1)
+            fh, fw   = frame.shape[:2]
+            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            result = landmarker.detect(mp_image)
+            hand_result = hand_landmarker.detect(mp_image)
+            face_result = face_landmarker.detect(mp_image)
 
-            if result.hand_landmarks:
-                for hand_index, hand_landmarks in enumerate(result.hand_landmarks):
-                    points = []
+            # Collect face data for spatial checks
+            face_lms_list  = face_result.face_landmarks if face_result.face_landmarks else []
+            face_bboxes    = [get_face_bbox(fl, fw, fh) for fl in face_lms_list]
+            lip_bboxes     = [get_lip_bbox(fl, fw, fh)  for fl in face_lms_list]
 
-                    for lm in hand_landmarks:
-                        x, y = int(lm.x * w), int(lm.y * h)
-                        points.append((x, y))
+            active_two_hand_gesture = None
+            per_hand_gestures       = []   # (gesture_str, wrist_px, handedness_str)
+            num_hands               = len(hand_result.hand_landmarks) if hand_result.hand_landmarks else 0
 
-                    # Draw skeleton lines
-                    for start, end in HAND_CONNECTIONS:
-                        cv2.line(
-                            frame,
-                            points[start],
-                            points[end],
-                            (255, 0, 0),
-                            2
-                        )
+            # Hand processing
+            if hand_result.hand_landmarks:
+                all_lms = hand_result.hand_landmarks
+                all_h   = hand_result.handedness or []
 
-                    # Draw all joint dots
-                    for x, y in points:
-                        cv2.circle(frame, (x, y), 4, (0, 255, 255), -1)
+                active_two_hand_gesture = detect_two_hand_gesture(
+                    all_lms,
+                    [hh[0].category_name for hh in all_h] if all_h else [],
+                    face_lms_list,
+                    fw, fh,
+                )
 
-                    # Label fingertips
-                    for idx, name in FINGERTIPS.items():
-                        x, y = points[idx]
-                        cv2.putText(
-                            frame,
-                            name,
-                            (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 255, 0),
-                            1
-                        )
-                        cv2.circle(frame, (x, y), 7, (0, 255, 0), -1)
+                for hand_index, hand_landmarks in enumerate(all_lms):
+                    points = [(int(lm.x * fw), int(lm.y * fh)) for lm in hand_landmarks]
 
-                    # Get handedness if available
                     handedness = "Right"
-                    if result.handedness and len(result.handedness) > hand_index:
-                        handedness = result.handedness[hand_index][0].category_name
+                    if all_h and len(all_h) > hand_index:
+                        handedness = all_h[hand_index][0].category_name
 
-                    gesture = detect_gesture(hand_landmarks, handedness)
+                    if show_skeleton:
+                        for start, end in HAND_CONNECTIONS:
+                            cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
+                        for px, py in points:
+                            cv2.circle(frame, (px, py), 4, (0, 255, 255), -1)
+                        for idx, name in FINGERTIPS.items():
+                            px, py = points[idx]
+                            cv2.putText(frame, name, (px, py - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                            cv2.circle(frame, (px, py), 7, (0, 255, 0), -1)
 
-                    wrist_x, wrist_y = points[0]
-                    cv2.putText(
-                        frame,
-                        f"{handedness}: {gesture}",
-                        (wrist_x - 40, wrist_y - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 255),
-                        2
-                    )
+                    if active_two_hand_gesture:
+                        gesture = "Open Hand"
+                    else:
+                        gesture = detect_gesture(hand_landmarks, handedness)
 
+                        # Single hand only
+                        if num_hands == 1:
+
+                            # Drinking candidate: thumb near lips
+                            if gesture == "Drinking_candidate":
+                                if lip_bboxes and thumb_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
+                                    gesture = "Drinking"
+                                else:
+                                    gesture = "Call Me"   # fallback, pinky+thumb = Call Me shape
+
+                            # Erm / MonkeyThink: resolve with face
+                            elif gesture == "Erm":
+                                # Upgrade to MonkeyThink if index tip near lips
+                                if lip_bboxes and index_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
+                                    gesture = "MonkeyThink"
+                                # else stays Erm
+
+                            elif gesture == "Pointing":
+                                # Also check MonkeyThink for plain pointing near lips
+                                if lip_bboxes and index_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
+                                    gesture = "MonkeyThink"
+
+                        else:
+                            # Multi-hand: suppress single-hand-only gestures
+                            if gesture in ("Erm", "MonkeyThink", "Drinking_candidate", "Drinking"):
+                                gesture = detect_gesture.__wrapped__(hand_landmarks, handedness) \
+                                    if hasattr(detect_gesture, "__wrapped__") else f"—"
+
+                    per_hand_gestures.append((gesture, points[0], handedness))
+
+                    if show_skeleton:
+                        wrist_x, wrist_y = points[0]
+                        cv2.putText(frame, f"{handedness}: {gesture}",
+                                    (wrist_x - 40, wrist_y - 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            # Display
+            BANNER_GESTURES = {"Erm", "MonkeyThink", "Drinking",
+                               "Absolute Cinema", "NaNaNaNaNaNa"}
+
+            special = active_two_hand_gesture
+            if not special:
+                for g, _, _ in per_hand_gestures:
+                    if g in BANNER_GESTURES:
+                        special = g
+                        break
+
+            if special:
+                draw_banner(frame, special.upper())
+                draw_gesture_preview(frame, special, gesture_images)
+
+            # Face
+            if face_result.face_landmarks:
+                for face_index, face_landmarks in enumerate(face_result.face_landmarks):
+                    if show_skeleton:
+                        pts  = draw_face_landmarks(frame, face_landmarks, fw, fh)
+                        pose = estimate_head_pose(pts, fw, fh)
+                        if pose and 10 in pts:
+                            cv2.putText(frame, pose,
+                                        (pts[10][0] - 40, pts[10][1] - 15),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
+
+                    if (face_result.face_blendshapes
+                            and len(face_result.face_blendshapes) > face_index
+                            and show_skeleton):
+                        blendshapes = face_result.face_blendshapes[face_index]
+                        interesting = sorted(
+                            [b for b in blendshapes
+                             if b.score > 0.4 and b.category_name not in {
+                                 "eyeLookDownLeft", "eyeLookDownRight",
+                                 "eyeLookInLeft",   "eyeLookInRight",
+                                 "eyeLookOutLeft",  "eyeLookOutRight",
+                                 "eyeLookUpLeft",   "eyeLookUpRight"}],
+                            key=lambda b: b.score, reverse=True
+                        )
+                        for i, b in enumerate(interesting[:3]):
+                            cv2.putText(frame,
+                                        f"{b.category_name}: {b.score:.2f}",
+                                        (10, 30 + i * 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 180), 1)
+
+            draw_hud_hint(frame, show_skeleton)
             cv2.imshow("VibeCheck", frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            elif key == ord("s"):
+                show_skeleton = not show_skeleton
 
     cap.release()
     cv2.destroyAllWindows()

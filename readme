@@ -1,2 +1,4 @@
 python -m pip install opencv-python mediapipe
 #From : https://www.youtube.com/watch?v=1lN4L74BwWo
+
+Press 's' to toggle skeleton, 'q' to quit
