@@ -1,3 +1,5 @@
+import argparse
+import os
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -336,14 +338,18 @@ def estimate_head_pose(pts, w, h):
 
 # HUD 
 
-def draw_hud_hint(frame, show_skeleton):
-    fh, fw = frame.shape[:2]
-    state  = "ON" if show_skeleton else "OFF"
-    color  = (0, 255, 100) if show_skeleton else (0, 80, 255)
-    text   = f"[S] Skeleton: {state}"
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv2.putText(frame, text, (fw - tw - 10, th + 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+def draw_hud_hint(frame, show_skeleton, use_face_recognition=False):
+    fh, fw   = frame.shape[:2]
+    font     = cv2.FONT_HERSHEY_SIMPLEX
+    state    = "ON" if show_skeleton else "OFF"
+    sk_color = (0, 255, 100) if show_skeleton else (0, 80, 255)
+    sk_text  = f"[S] Skeleton: {state}"
+    (tw, th), _ = cv2.getTextSize(sk_text, font, 0.5, 1)
+    cv2.putText(frame, sk_text, (fw - tw - 10, th + 8), font, 0.5, sk_color, 1)
+    if use_face_recognition:
+        hint = "[E] Enroll face"
+        (ew, _), _ = cv2.getTextSize(hint, font, 0.5, 1)
+        cv2.putText(frame, hint, (fw - ew - 10, th + 28), font, 0.5, (180, 180, 255), 1)
 
 
 def draw_banner(frame, text, color=(0, 215, 255)):
@@ -357,9 +363,56 @@ def draw_banner(frame, text, color=(0, 215, 255)):
                 cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3)
 
 
+# Known-face enrollment
+
+def next_enrollment_path(directory="known_faces"):
+    os.makedirs(directory, exist_ok=True)
+    existing = [
+        f for f in os.listdir(directory)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ]
+    indices = []
+    for f in existing:
+        stem = os.path.splitext(f)[0]
+        if stem.isdigit():
+            indices.append(int(stem))
+    next_idx = max(indices) + 1 if indices else 0
+    return os.path.join(directory, f"{next_idx:03d}.jpg")
+
+
+def enroll_face(frame, face_lms_list, fw, fh):
+    if not face_lms_list:
+        print("[INFO] No face detected — enrollment skipped.")
+        return
+    bbox = get_face_bbox(face_lms_list[0], fw, fh, padding=0.08)
+    x0, y0, x1, y1 = bbox
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(fw, x1), min(fh, y1)
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0:
+        print("[INFO] Face crop was empty — enrollment skipped.")
+        return
+    path = next_enrollment_path()
+    cv2.imwrite(path, crop)
+    print(f"[INFO] Face saved to {path}")
+
+
 # Main
 
 def main():
+    parser = argparse.ArgumentParser(description="VibeCheck")
+    parser.add_argument("--face-recognition", action="store_true",
+                        help="Enable facial recognition (default: off)")
+    args = parser.parse_args()
+
+    use_face_recognition = args.face_recognition
+
+    if use_face_recognition:
+        from face_recognition_module import FaceRecognizer, draw_recognition_result
+        recognizer = FaceRecognizer()
+    else:
+        recognizer = None
+
     gesture_images = load_gesture_images()
     show_skeleton  = True
 
@@ -394,16 +447,17 @@ def main():
             hand_result = hand_landmarker.detect(mp_image)
             face_result = face_landmarker.detect(mp_image)
 
-            # Collect face data for spatial checks
-            face_lms_list  = face_result.face_landmarks if face_result.face_landmarks else []
-            face_bboxes    = [get_face_bbox(fl, fw, fh) for fl in face_lms_list]
-            lip_bboxes     = [get_lip_bbox(fl, fw, fh)  for fl in face_lms_list]
+            face_lms_list = face_result.face_landmarks if face_result.face_landmarks else []
+            lip_bboxes    = [get_lip_bbox(fl, fw, fh) for fl in face_lms_list]
+
+            if use_face_recognition and show_skeleton:
+                for (top, right, bottom, left), name, matched in recognizer.update(rgb):
+                    draw_recognition_result(frame, top, right, bottom, left, name, matched)
 
             active_two_hand_gesture = None
-            per_hand_gestures       = []   # (gesture_str, wrist_px, handedness_str)
+            per_hand_gestures       = []
             num_hands               = len(hand_result.hand_landmarks) if hand_result.hand_landmarks else 0
 
-            # Hand processing
             if hand_result.hand_landmarks:
                 all_lms = hand_result.hand_landmarks
                 all_h   = hand_result.handedness or []
@@ -438,33 +492,25 @@ def main():
                     else:
                         gesture = detect_gesture(hand_landmarks, handedness)
 
-                        # Single hand only
                         if num_hands == 1:
-
-                            # Drinking candidate: thumb near lips
                             if gesture == "Drinking_candidate":
                                 if lip_bboxes and thumb_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
                                     gesture = "Drinking"
                                 else:
-                                    gesture = "Call Me"   # fallback, pinky+thumb = Call Me shape
+                                    gesture = "Call Me"
 
-                            # Erm / MonkeyThink: resolve with face
                             elif gesture == "Erm":
-                                # Upgrade to MonkeyThink if index tip near lips
                                 if lip_bboxes and index_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
                                     gesture = "MonkeyThink"
-                                # else stays Erm
 
                             elif gesture == "Pointing":
-                                # Also check MonkeyThink for plain pointing near lips
                                 if lip_bboxes and index_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
                                     gesture = "MonkeyThink"
 
                         else:
-                            # Multi-hand: suppress single-hand-only gestures
                             if gesture in ("Erm", "MonkeyThink", "Drinking_candidate", "Drinking"):
                                 gesture = detect_gesture.__wrapped__(hand_landmarks, handedness) \
-                                    if hasattr(detect_gesture, "__wrapped__") else f"—"
+                                    if hasattr(detect_gesture, "__wrapped__") else "—"
 
                     per_hand_gestures.append((gesture, points[0], handedness))
 
@@ -474,7 +520,6 @@ def main():
                                     (wrist_x - 40, wrist_y - 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            # Display
             BANNER_GESTURES = {"Erm", "MonkeyThink", "Drinking",
                                "Absolute Cinema", "NaNaNaNaNaNa"}
 
@@ -489,7 +534,6 @@ def main():
                 draw_banner(frame, special.upper())
                 draw_gesture_preview(frame, special, gesture_images)
 
-            # Face
             if face_result.face_landmarks:
                 for face_index, face_landmarks in enumerate(face_result.face_landmarks):
                     if show_skeleton:
@@ -519,7 +563,7 @@ def main():
                                         (10, 30 + i * 22),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 180), 1)
 
-            draw_hud_hint(frame, show_skeleton)
+            draw_hud_hint(frame, show_skeleton, use_face_recognition)
             cv2.imshow("VibeCheck", frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -527,6 +571,11 @@ def main():
                 break
             elif key == ord("s"):
                 show_skeleton = not show_skeleton
+            elif key == ord("e"):
+                enroll_face(frame, face_lms_list, fw, fh)
+                if use_face_recognition and recognizer is not None:
+                    from face_recognition_module import load_known_faces
+                    recognizer.known_encodings, recognizer.known_names = load_known_faces()
 
     cap.release()
     cv2.destroyAllWindows()
