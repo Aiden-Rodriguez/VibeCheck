@@ -16,6 +16,7 @@ The main program is `VibeCheck.py`. Optional face recognition support lives in
 - Draws hand skeletons, fingertips, face feature outlines, and head pose hints.
 - Recognizes popular 'meme' gestures like:
   - `Erm`
+  - `Infinite Void`
   - `MonkeyThink`
   - `Drinking`
   - `Absolute Cinema`
@@ -117,6 +118,8 @@ recognition is enabled, the known-face list is reloaded after enrollment.
 5. Hand landmarks are interpreted with simple geometry:
    - A finger is considered "up" when its tip is above its lower joint.
    - The thumb is checked sideways based on handedness.
+   - `Infinite Void` looks for a straight index finger with the middle finger
+     clustered close to it.
    - Two open hands trigger the `Absolute Cinema` gesture.
    - Two open hands near the head trigger `NaNaNaNaNaNa`.
 6. Face landmarks are used for:
