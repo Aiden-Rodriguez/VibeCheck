@@ -6,11 +6,13 @@ import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-cap = cv2.VideoCapture(0)
-cap.set(3, 1280)
-cap.set(4, 720)
-
 # Constants
+
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+WINDOW_NAME = "VibeCheck"
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+DEFAULT_HANDEDNESS = "Right"
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -22,6 +24,16 @@ HAND_CONNECTIONS = [
 ]
 
 FINGERTIPS = {4: "thumb", 8: "index", 12: "middle", 16: "ring", 20: "pinky"}
+
+LIP_LANDMARKS = [
+    61, 185, 40, 39, 37, 0, 267, 269, 270, 409,
+    291, 375, 321, 405, 314, 17, 84, 181, 91, 146,
+]
+
+EAR_REGION_LANDMARKS = {
+    "left": [234, 127, 162, 21],
+    "right": [454, 356, 389, 251],
+}
 
 FACE_KEY_POINTS = {
     33: "L_eye_outer", 133: "L_eye_inner",
@@ -68,8 +80,39 @@ GESTURE_IMAGES = {
     "Drinking":        "images/beerguy.jpg",
 }
 
+BANNER_GESTURES = {
+    "Erm",
+    "Hang Twenty",
+    "Infinite Void",
+    "MonkeyThink",
+    "Drinking",
+    "Absolute Cinema",
+    "NaNaNaNaNaNa",
+}
+
+MULTI_HAND_SUPPRESSED_GESTURES = {
+    "Erm",
+    "MonkeyThink",
+    "Drinking_candidate",
+    "Drinking",
+}
+
+IGNORED_BLENDSHAPES = {
+    "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft", "eyeLookInRight",
+    "eyeLookOutLeft", "eyeLookOutRight",
+    "eyeLookUpLeft", "eyeLookUpRight",
+}
+
 
 # Image helpers
+
+def create_camera(index=0):
+    camera = cv2.VideoCapture(index)
+    camera.set(3, CAMERA_WIDTH)
+    camera.set(4, CAMERA_HEIGHT)
+    return camera
+
 
 def load_gesture_images():
     cache = {}
@@ -287,10 +330,8 @@ def get_lip_bbox(face_landmarks, w, h, padding=0.03):
     """
     Tight bounding box around the lip region using outer-lip landmark indices.
     """
-    lip_indices = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
-                   375, 321, 405, 314, 17, 84, 181, 91, 146]
-    xs = [face_landmarks[i].x for i in lip_indices]
-    ys = [face_landmarks[i].y for i in lip_indices]
+    xs = [face_landmarks[i].x for i in LIP_LANDMARKS]
+    ys = [face_landmarks[i].y for i in LIP_LANDMARKS]
     return (
         int(min(xs) * w - padding * w),
         int(min(ys) * h - padding * h),
@@ -306,11 +347,7 @@ def get_ear_region(face_landmarks, w, h, side="left"):
     'right' uses right cheek / temple landmarks (454, 356, 389, 251)
     Returns (x_min, y_min, x_max, y_max) with generous padding.
     """
-    if side == "left":
-        indices = [234, 127, 162, 21]
-    else:
-        indices = [454, 356, 389, 251]
-
+    indices = EAR_REGION_LANDMARKS[side]
     xs = [face_landmarks[i].x for i in indices]
     ys = [face_landmarks[i].y for i in indices]
     pad = 0.10
@@ -407,6 +444,84 @@ def detect_two_hand_gesture(hand_landmarks_list, handedness_list, face_landmarks
     return None
 
 
+# Hand drawing and gesture orchestration
+
+def handedness_labels(handedness_result):
+    if not handedness_result:
+        return []
+    return [
+        handedness[0].category_name if handedness else DEFAULT_HANDEDNESS
+        for handedness in handedness_result
+    ]
+
+
+def hand_points(hand_landmarks, w, h):
+    return [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+
+
+def draw_hand_overlay(frame, points):
+    for start, end in HAND_CONNECTIONS:
+        cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
+    for px, py in points:
+        cv2.circle(frame, (px, py), 4, (0, 255, 255), -1)
+    for idx, name in FINGERTIPS.items():
+        px, py = points[idx]
+        cv2.putText(frame, name, (px, py - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.circle(frame, (px, py), 7, (0, 255, 0), -1)
+
+
+def draw_hand_label(frame, points, handedness, gesture):
+    wrist_x, wrist_y = points[0]
+    cv2.putText(frame, f"{handedness}: {gesture}",
+                (wrist_x - 40, wrist_y - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+
+def apply_single_hand_face_context(gesture, hand_landmarks, lip_bboxes, w, h):
+    if gesture == "Drinking_candidate":
+        if lip_bboxes and thumb_tip_in_bbox(hand_landmarks, w, h, lip_bboxes[0]):
+            return "Drinking"
+        return "Call Me"
+
+    if gesture in ("Erm", "Pointing"):
+        if lip_bboxes and index_tip_in_bbox(hand_landmarks, w, h, lip_bboxes[0]):
+            return "MonkeyThink"
+
+    return gesture
+
+
+def resolve_hand_gesture(
+    hand_landmarks,
+    handedness,
+    active_two_hand_gesture,
+    num_hands,
+    lip_bboxes,
+    w,
+    h,
+):
+    if active_two_hand_gesture:
+        return "Open Hand"
+
+    gesture = detect_gesture(hand_landmarks, handedness)
+    if num_hands == 1:
+        return apply_single_hand_face_context(gesture, hand_landmarks, lip_bboxes, w, h)
+
+    if gesture in MULTI_HAND_SUPPRESSED_GESTURES:
+        return "-"
+    return gesture
+
+
+def select_special_gesture(active_two_hand_gesture, per_hand_gestures):
+    if active_two_hand_gesture:
+        return active_two_hand_gesture
+
+    for gesture, _, _ in per_hand_gestures:
+        if gesture in BANNER_GESTURES:
+            return gesture
+    return None
+
+
 # Face drawing
 
 def draw_face_landmarks(frame, face_landmarks, w, h):
@@ -477,7 +592,7 @@ def next_enrollment_path(directory="known_faces"):
     os.makedirs(directory, exist_ok=True)
     existing = [
         f for f in os.listdir(directory)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        if f.lower().endswith(IMAGE_EXTENSIONS)
     ]
     indices = []
     for f in existing:
@@ -521,6 +636,7 @@ def main():
     else:
         recognizer = None
 
+    cap = create_camera()
     gesture_images = load_gesture_images()
     show_skeleton  = True
 
@@ -568,75 +684,40 @@ def main():
 
             if hand_result.hand_landmarks:
                 all_lms = hand_result.hand_landmarks
-                all_h   = hand_result.handedness or []
+                all_h   = handedness_labels(hand_result.handedness)
 
                 active_two_hand_gesture = detect_two_hand_gesture(
                     all_lms,
-                    [hh[0].category_name for hh in all_h] if all_h else [],
+                    all_h,
                     face_lms_list,
                     fw, fh,
                 )
 
                 for hand_index, hand_landmarks in enumerate(all_lms):
-                    points = [(int(lm.x * fw), int(lm.y * fh)) for lm in hand_landmarks]
-
-                    handedness = "Right"
-                    if all_h and len(all_h) > hand_index:
-                        handedness = all_h[hand_index][0].category_name
+                    points = hand_points(hand_landmarks, fw, fh)
+                    handedness = (
+                        all_h[hand_index] if len(all_h) > hand_index else DEFAULT_HANDEDNESS
+                    )
 
                     if show_skeleton:
-                        for start, end in HAND_CONNECTIONS:
-                            cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
-                        for px, py in points:
-                            cv2.circle(frame, (px, py), 4, (0, 255, 255), -1)
-                        for idx, name in FINGERTIPS.items():
-                            px, py = points[idx]
-                            cv2.putText(frame, name, (px, py - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                            cv2.circle(frame, (px, py), 7, (0, 255, 0), -1)
+                        draw_hand_overlay(frame, points)
 
-                    if active_two_hand_gesture:
-                        gesture = "Open Hand"
-                    else:
-                        gesture = detect_gesture(hand_landmarks, handedness)
-
-                        if num_hands == 1:
-                            if gesture == "Drinking_candidate":
-                                if lip_bboxes and thumb_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
-                                    gesture = "Drinking"
-                                else:
-                                    gesture = "Call Me"
-
-                            elif gesture == "Erm":
-                                if lip_bboxes and index_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
-                                    gesture = "MonkeyThink"
-
-                            elif gesture == "Pointing":
-                                if lip_bboxes and index_tip_in_bbox(hand_landmarks, fw, fh, lip_bboxes[0]):
-                                    gesture = "MonkeyThink"
-
-                        else:
-                            if gesture in ("Erm", "MonkeyThink", "Drinking_candidate", "Drinking"):
-                                gesture = detect_gesture.__wrapped__(hand_landmarks, handedness) \
-                                    if hasattr(detect_gesture, "__wrapped__") else "—"
+                    gesture = resolve_hand_gesture(
+                        hand_landmarks,
+                        handedness,
+                        active_two_hand_gesture,
+                        num_hands,
+                        lip_bboxes,
+                        fw,
+                        fh,
+                    )
 
                     per_hand_gestures.append((gesture, points[0], handedness))
 
                     if show_skeleton:
-                        wrist_x, wrist_y = points[0]
-                        cv2.putText(frame, f"{handedness}: {gesture}",
-                                    (wrist_x - 40, wrist_y - 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        draw_hand_label(frame, points, handedness, gesture)
 
-            BANNER_GESTURES = {"Erm", "Hang Twenty", "Infinite Void", "MonkeyThink", "Drinking",
-                               "Absolute Cinema", "NaNaNaNaNaNa"}
-
-            special = active_two_hand_gesture
-            if not special:
-                for g, _, _ in per_hand_gestures:
-                    if g in BANNER_GESTURES:
-                        special = g
-                        break
+            special = select_special_gesture(active_two_hand_gesture, per_hand_gestures)
 
             if special:
                 draw_banner(frame, special.upper())
@@ -658,11 +739,7 @@ def main():
                         blendshapes = face_result.face_blendshapes[face_index]
                         interesting = sorted(
                             [b for b in blendshapes
-                             if b.score > 0.4 and b.category_name not in {
-                                 "eyeLookDownLeft", "eyeLookDownRight",
-                                 "eyeLookInLeft",   "eyeLookInRight",
-                                 "eyeLookOutLeft",  "eyeLookOutRight",
-                                 "eyeLookUpLeft",   "eyeLookUpRight"}],
+                             if b.score > 0.4 and b.category_name not in IGNORED_BLENDSHAPES],
                             key=lambda b: b.score, reverse=True
                         )
                         for i, b in enumerate(interesting[:3]):
@@ -672,7 +749,7 @@ def main():
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 180), 1)
 
             draw_hud_hint(frame, show_skeleton, use_face_recognition)
-            cv2.imshow("VibeCheck", frame)
+            cv2.imshow(WINDOW_NAME, frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
