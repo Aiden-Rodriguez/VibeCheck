@@ -61,6 +61,7 @@ FEATURE_COLORS = {
 GESTURE_IMAGES = {
     "Absolute Cinema": "images/AbsoluteCinema.png",
     "Erm":             "images/ErmDog.jpg",
+    "Hang Twenty":     "images/HangTwenty.png",
     "Infinite Void":   "images/InfiniteVoid.png",
     "MonkeyThink":     "images/ThinkingMonkey.jpeg",
     "NaNaNaNaNaNa":    "images/NaNaNaNaNaNa.jpg",
@@ -187,6 +188,28 @@ def thumb_is_extended(landmarks, handedness):
         return tip.x < base.x
     else:
         return tip.x > base.x
+
+
+def finger_is_extended(landmarks, mcp, pip, tip):
+    wrist = landmark_xy(landmarks, 0)
+    mcp_pt = landmark_xy(landmarks, mcp)
+    pip_pt = landmark_xy(landmarks, pip)
+    tip_pt = landmark_xy(landmarks, tip)
+
+    return (
+        np.linalg.norm(tip_pt - wrist) > np.linalg.norm(pip_pt - wrist) * 1.08
+        and np.linalg.norm(tip_pt - mcp_pt) > np.linalg.norm(pip_pt - mcp_pt) * 1.10
+    )
+
+
+def is_hang_ten(landmarks, handedness):
+    return (
+        thumb_is_extended(landmarks, handedness)
+        and finger_is_extended(landmarks, 17, 18, 20)
+        and not finger_is_extended(landmarks, 5, 6, 8)
+        and not finger_is_extended(landmarks, 9, 10, 12)
+        and not finger_is_extended(landmarks, 13, 14, 16)
+    )
 
 
 def index_finger_is_straight(landmarks):
@@ -355,8 +378,13 @@ def detect_two_hand_gesture(hand_landmarks_list, handedness_list, face_landmarks
         return None
 
     lms_a, lms_b = hand_landmarks_list[0], hand_landmarks_list[1]
+    hand_a = handedness_list[0] if len(handedness_list) > 0 else "Right"
+    hand_b = handedness_list[1] if len(handedness_list) > 1 else "Left"
 
     thumb_near_head = False
+
+    if is_hang_ten(lms_a, hand_a) and is_hang_ten(lms_b, hand_b):
+        return "Hang Twenty"
 
     if is_palm_open(lms_a) and is_palm_open(lms_b):
         if face_landmarks_list:
@@ -600,7 +628,7 @@ def main():
                                     (wrist_x - 40, wrist_y - 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            BANNER_GESTURES = {"Erm", "Infinite Void", "MonkeyThink", "Drinking",
+            BANNER_GESTURES = {"Erm", "Hang Twenty", "Infinite Void", "MonkeyThink", "Drinking",
                                "Absolute Cinema", "NaNaNaNaNaNa"}
 
             special = active_two_hand_gesture
