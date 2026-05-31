@@ -61,6 +61,8 @@ FEATURE_COLORS = {
 GESTURE_IMAGES = {
     "Absolute Cinema": "images/AbsoluteCinema.png",
     "Erm":             "images/ErmDog.jpg",
+    "Hang Twenty":     "images/HangTwenty.png",
+    "Infinite Void":   "images/InfiniteVoid.png",
     "MonkeyThink":     "images/ThinkingMonkey.jpeg",
     "NaNaNaNaNaNa":    "images/NaNaNaNaNaNa.jpg",
     "Drinking":        "images/beerguy.jpg",
@@ -152,6 +154,23 @@ def finger_is_up(landmarks, tip, pip):
     return landmarks[tip].y < landmarks[pip].y
 
 
+def landmark_xy(landmarks, index):
+    lm = landmarks[index]
+    return np.array([lm.x, lm.y])
+
+
+def point_to_segment_distance(point, start, end):
+    segment = end - start
+    segment_len_sq = np.dot(segment, segment)
+    if segment_len_sq == 0:
+        return np.linalg.norm(point - start)
+
+    t = np.dot(point - start, segment) / segment_len_sq
+    t = np.clip(t, 0, 1)
+    closest = start + t * segment
+    return np.linalg.norm(point - closest)
+
+
 def is_palm_open(landmarks):
     return all([
         finger_is_up(landmarks, 8,  6),
@@ -169,6 +188,86 @@ def thumb_is_extended(landmarks, handedness):
         return tip.x < base.x
     else:
         return tip.x > base.x
+
+
+def finger_is_extended(landmarks, mcp, pip, tip):
+    wrist = landmark_xy(landmarks, 0)
+    mcp_pt = landmark_xy(landmarks, mcp)
+    pip_pt = landmark_xy(landmarks, pip)
+    tip_pt = landmark_xy(landmarks, tip)
+
+    return (
+        np.linalg.norm(tip_pt - wrist) > np.linalg.norm(pip_pt - wrist) * 1.08
+        and np.linalg.norm(tip_pt - mcp_pt) > np.linalg.norm(pip_pt - mcp_pt) * 1.10
+    )
+
+
+def is_hang_ten(landmarks, handedness):
+    return (
+        thumb_is_extended(landmarks, handedness)
+        and finger_is_extended(landmarks, 17, 18, 20)
+        and not finger_is_extended(landmarks, 5, 6, 8)
+        and not finger_is_extended(landmarks, 9, 10, 12)
+        and not finger_is_extended(landmarks, 13, 14, 16)
+    )
+
+
+def index_finger_is_straight(landmarks):
+    index_mcp = landmark_xy(landmarks, 5)
+    index_tip = landmark_xy(landmarks, 8)
+    index_pip = landmark_xy(landmarks, 6)
+    index_dip = landmark_xy(landmarks, 7)
+    index_len = max(np.linalg.norm(index_tip - index_mcp), 0.001)
+
+    pip_offset = point_to_segment_distance(index_pip, index_mcp, index_tip)
+    dip_offset = point_to_segment_distance(index_dip, index_mcp, index_tip)
+
+    return (
+        finger_is_up(landmarks, 8, 6)
+        and pip_offset < index_len * 0.18
+        and dip_offset < index_len * 0.18
+    )
+
+
+def is_infinite_void_pose(landmarks):
+    index_mcp = landmark_xy(landmarks, 5)
+    index_tip = landmark_xy(landmarks, 8)
+    index_pip = landmark_xy(landmarks, 6)
+    middle_mcp = landmark_xy(landmarks, 9)
+    middle_pip = landmark_xy(landmarks, 10)
+    middle_dip = landmark_xy(landmarks, 11)
+    middle_tip = landmark_xy(landmarks, 12)
+    palm_width = max(
+        np.linalg.norm(landmark_xy(landmarks, 5) - landmark_xy(landmarks, 17)),
+        0.001,
+    )
+    index_len = max(np.linalg.norm(index_tip - index_mcp), 0.001)
+    middle_len = max(np.linalg.norm(middle_tip - middle_mcp), 0.001)
+
+    middle_close_to_index = (
+        np.linalg.norm(middle_tip - index_tip) < palm_width * 0.28
+        or min(
+            point_to_segment_distance(middle_dip, index_pip, index_tip),
+            point_to_segment_distance(middle_tip, index_pip, index_tip),
+        ) < palm_width * 0.35
+    )
+    middle_bent = (
+        point_to_segment_distance(middle_pip, middle_mcp, middle_tip) > middle_len * 0.12
+        or point_to_segment_distance(middle_dip, middle_mcp, middle_tip) > middle_len * 0.12
+    )
+    middle_less_extended = middle_len < index_len * 0.92
+    middle_depth_offset = abs(landmarks[12].z - landmarks[8].z) > palm_width * 0.10
+    middle_crossing_index = (
+        middle_close_to_index
+        and (middle_bent or middle_less_extended or middle_depth_offset)
+    )
+
+    return (
+        index_finger_is_straight(landmarks)
+        and middle_crossing_index
+        and not finger_is_up(landmarks, 16, 14)
+        and not finger_is_up(landmarks, 20, 18)
+    )
 
 
 # Face geometry
@@ -259,6 +358,10 @@ def detect_gesture(landmarks, handedness="Right"):
     if pinky_up and not index_up and not middle_up and not ring_up:
         return "Drinking_candidate"
 
+    # Infinite Void: index straight with the middle finger crossing near it.
+    if is_infinite_void_pose(landmarks):
+        return "Infinite Void"
+
     # Erm: index up + thumb visibly extended, others curled
     if index_up and thumb_ext and not middle_up and not ring_up and not pinky_up:
         return "Erm"
@@ -275,8 +378,13 @@ def detect_two_hand_gesture(hand_landmarks_list, handedness_list, face_landmarks
         return None
 
     lms_a, lms_b = hand_landmarks_list[0], hand_landmarks_list[1]
+    hand_a = handedness_list[0] if len(handedness_list) > 0 else "Right"
+    hand_b = handedness_list[1] if len(handedness_list) > 1 else "Left"
 
     thumb_near_head = False
+
+    if is_hang_ten(lms_a, hand_a) and is_hang_ten(lms_b, hand_b):
+        return "Hang Twenty"
 
     if is_palm_open(lms_a) and is_palm_open(lms_b):
         if face_landmarks_list:
@@ -520,7 +628,7 @@ def main():
                                     (wrist_x - 40, wrist_y - 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            BANNER_GESTURES = {"Erm", "MonkeyThink", "Drinking",
+            BANNER_GESTURES = {"Erm", "Hang Twenty", "Infinite Void", "MonkeyThink", "Drinking",
                                "Absolute Cinema", "NaNaNaNaNaNa"}
 
             special = active_two_hand_gesture
