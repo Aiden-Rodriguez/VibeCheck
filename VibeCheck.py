@@ -1,8 +1,17 @@
 import argparse
 import os
+import time
 import cv2
 import mediapipe as mp
 import numpy as np
+from emote_chain import EmoteChainAuthenticator
+from emote_chain_config import (
+    EMOTE_DISPLAY_NAMES,
+    EMOTE_PASSWORD,
+    HOLD_SECONDS,
+    STATUS_MESSAGE_SECONDS,
+    STEP_TIMEOUT_SECONDS,
+)
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -107,6 +116,12 @@ IGNORED_BLENDSHAPES = {
 
 # Image helpers
 
+def emote_display_name(emote):
+    if not emote:
+        return "-"
+    return EMOTE_DISPLAY_NAMES.get(emote, emote)
+
+
 def create_camera(index=0):
     camera = cv2.VideoCapture(index)
     camera.set(3, CAMERA_WIDTH)
@@ -129,10 +144,16 @@ def draw_gesture_preview(frame, gesture_name, image_cache, size=180):
     if gesture_name not in image_cache:
         return
     fh, fw = frame.shape[:2]
-    thumb   = cv2.resize(image_cache[gesture_name], (size, size))
     margin  = 12
     x_off   = fw - size - margin
     y_off   = fh - size - margin
+    draw_gesture_image_tile(frame, gesture_name, image_cache, x_off, y_off, size)
+
+
+def draw_gesture_image_tile(frame, gesture_name, image_cache, x_off, y_off, size=120):
+    if gesture_name not in image_cache:
+        return
+    thumb   = cv2.resize(image_cache[gesture_name], (size, size))
     roi     = frame[y_off:y_off + size, x_off:x_off + size]
 
     if thumb.shape[2] == 4:
@@ -144,7 +165,7 @@ def draw_gesture_preview(frame, gesture_name, image_cache, size=180):
     frame[y_off:y_off + size, x_off:x_off + size] = blended
     cv2.rectangle(frame, (x_off - 1, y_off - 1),
                   (x_off + size, y_off + size), (255, 255, 255), 1)
-    cv2.putText(frame, gesture_name, (x_off, y_off - 6),
+    cv2.putText(frame, emote_display_name(gesture_name), (x_off, y_off - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
 
@@ -569,10 +590,49 @@ def draw_hud_hint(frame, show_skeleton, use_face_recognition=False):
     sk_text  = f"[S] Skeleton: {state}"
     (tw, th), _ = cv2.getTextSize(sk_text, font, 0.5, 1)
     cv2.putText(frame, sk_text, (fw - tw - 10, th + 8), font, 0.5, sk_color, 1)
+    chain_hint = "[C] Emote chain"
+    (cw, _), _ = cv2.getTextSize(chain_hint, font, 0.5, 1)
+    cv2.putText(frame, chain_hint, (fw - cw - 10, th + 28), font, 0.5, (255, 220, 120), 1)
     if use_face_recognition:
         hint = "[E] Enroll face"
         (ew, _), _ = cv2.getTextSize(hint, font, 0.5, 1)
-        cv2.putText(frame, hint, (fw - ew - 10, th + 28), font, 0.5, (180, 180, 255), 1)
+        cv2.putText(frame, hint, (fw - ew - 10, th + 48), font, 0.5, (180, 180, 255), 1)
+
+
+def draw_emote_chain_hud(frame, authenticator, detected_emote, image_cache, now):
+    if authenticator.succeeded:
+        draw_banner(frame, "EMOTE CHAIN ACCEPTED", (80, 255, 120))
+    elif authenticator.failed:
+        draw_banner(frame, "EMOTE CHAIN RESET", (60, 80, 255))
+
+    if not authenticator.active:
+        return
+
+    step, total = authenticator.progress
+    target = authenticator.current_target
+    remaining = authenticator.remaining_seconds(now)
+    held = authenticator.held_seconds(now)
+
+    x0, y0 = 10, 10
+    panel_w, panel_h = 330, 220
+    cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (18, 18, 18), -1)
+    cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (255, 220, 120), 1)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(frame, "EMOTE CHAIN", (x0 + 12, y0 + 26),
+                font, 0.65, (255, 220, 120), 2)
+    cv2.putText(frame, f"Step: {step + 1}/{total}", (x0 + 12, y0 + 56),
+                font, 0.55, (255, 255, 255), 1)
+    cv2.putText(frame, f"Target: {emote_display_name(target)}", (x0 + 12, y0 + 82),
+                font, 0.55, (255, 255, 255), 1)
+    cv2.putText(frame, f"Detected: {emote_display_name(detected_emote)}", (x0 + 12, y0 + 108),
+                font, 0.55, (210, 210, 210), 1)
+    cv2.putText(frame, f"Time: {remaining:.1f}s", (x0 + 12, y0 + 134),
+                font, 0.55, (210, 210, 210), 1)
+    cv2.putText(frame, f"Hold: {held:.1f}/{authenticator.hold_seconds:.1f}s",
+                (x0 + 12, y0 + 160), font, 0.55, (210, 210, 210), 1)
+
+    draw_gesture_image_tile(frame, target, image_cache, x0 + panel_w - 128, y0 + 88, 110)
 
 
 def draw_banner(frame, text, color=(0, 215, 255)):
@@ -638,6 +698,12 @@ def main():
 
     cap = create_camera()
     gesture_images = load_gesture_images()
+    emote_chain = EmoteChainAuthenticator(
+        EMOTE_PASSWORD,
+        STEP_TIMEOUT_SECONDS,
+        HOLD_SECONDS,
+        STATUS_MESSAGE_SECONDS,
+    )
     show_skeleton  = True
 
     hand_options = vision.HandLandmarkerOptions(
@@ -718,6 +784,8 @@ def main():
                         draw_hand_label(frame, points, handedness, gesture)
 
             special = select_special_gesture(active_two_hand_gesture, per_hand_gestures)
+            now = time.monotonic()
+            emote_chain.update(special, now)
 
             if special:
                 draw_banner(frame, special.upper())
@@ -749,6 +817,7 @@ def main():
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 180), 1)
 
             draw_hud_hint(frame, show_skeleton, use_face_recognition)
+            draw_emote_chain_hud(frame, emote_chain, special, gesture_images, now)
             cv2.imshow(WINDOW_NAME, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -756,6 +825,9 @@ def main():
                 break
             elif key == ord("s"):
                 show_skeleton = not show_skeleton
+            elif key == ord("c"):
+                emote_chain.start(time.monotonic())
+                print("[INFO] Emote chain authentication started.")
             elif key == ord("e"):
                 enroll_face(frame, face_lms_list, fw, fh)
                 if use_face_recognition and recognizer is not None:
