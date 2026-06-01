@@ -6,7 +6,8 @@ draws landmark overlays, and displays matching reaction images for special
 gestures.
 
 The main program is `VibeCheck.py`. Optional face recognition support lives in
-`face_recognition_module.py`.
+`face_recognition_module.py`. The first emote-chain password prototype is
+configured in `emote_chain_config.py`.
 
 ## What It Does
 
@@ -23,6 +24,8 @@ The main program is `VibeCheck.py`. Optional face recognition support lives in
   - `Absolute Cinema`
   - `NaNaNaNaNaNa`
 - Shows a large banner and preview image when a special gesture is detected.
+- Supports a prototype emote-chain password flow using a hardcoded sequence of
+  gestures.
 - Optionally recognizes known faces from images stored in `known_faces/`.
 
 ## Project Structure
@@ -30,6 +33,8 @@ The main program is `VibeCheck.py`. Optional face recognition support lives in
 ```text
 .
 ├── VibeCheck.py                # Main webcam app
+├── emote_chain.py              # Emote-chain password state machine
+├── emote_chain_config.py       # Hardcoded prototype emote password/settings
 ├── face_recognition_module.py  # Optional known-face recognition helper
 ├── hand_landmarker.task        # MediaPipe hand model
 ├── face_landmarker.task        # MediaPipe face model
@@ -103,12 +108,38 @@ python VibeCheck.py
 
 | Key | Action |
 | --- | --- |
+| `c` | Start or reset emote-chain authentication |
+| `r` | Randomize the emote-chain password (picks a new 3-step sequence) |
 | `s` | Toggle skeleton/landmark overlays |
 | `e` | Enroll the currently detected face into `known_faces/` |
 | `q` | Quit |
 
-The `e` enrollment key saves a cropped face image into `known_faces/`. If face
-recognition is enabled, the known-face list is reloaded after enrollment.
+The `c` key starts the emote-chain password test. The current prototype password
+is configured in `emote_chain_config.py` as:
+
+```text
+Monkey Thinking -> Infinite Void -> Erm
+```
+
+The `r` key randomizes the password to a fresh 3-step sequence drawn from the
+available gesture set (no consecutive repeats). The new sequence is printed to
+the console and displayed as a breadcrumb inside the on-screen chain panel.
+
+Each step must be matched within 3 seconds and held steadily for 0.5 seconds.
+If the current step is not matched in time, the chain resets to the first emote.
+The on-screen chain panel shows the full password breadcrumb, current target
+image, detected emote, progress, remaining time, and hold progress.
+
+**Face-recognition gate:** when the app is launched with `--face-recognition`,
+the emote-chain will only accept gestures while a *recognized* face (one present
+in `known_faces/`) is visible on camera. If no recognized face is detected, a
+red "FACE NOT RECOGNIZED" warning is drawn and the chain timer is paused until
+a known face appears.
+
+The `s` key toggles all skeleton and landmark debug overlays. The `e`
+enrollment key saves a cropped face image into `known_faces/`. If face
+recognition is enabled, the known-face list is reloaded after enrollment. The
+`q` key exits the webcam app.
 
 ## How The App Works
 
@@ -132,7 +163,10 @@ recognition is enabled, the known-face list is reloaded after enrollment.
    - Gesture context, such as detecting a finger near the mouth.
 7. If a special gesture is active, the app draws a banner and displays the
    matching image from `images/`.
-8. If `--face-recognition` is enabled, `face_recognition_module.py` checks faces
+8. If emote-chain authentication is active, the current special gesture is
+   checked against the configured password step. A matching emote must remain
+   stable for 0.5 seconds before the chain advances.
+9. If `--face-recognition` is enabled, `face_recognition_module.py` checks faces
    against reference images in `known_faces/` every few frames and draws labeled
    boxes.
 
@@ -154,5 +188,7 @@ Those would display as `Jimmy` and `Jane Doe`.
   `VibeCheck.py` are changed.
 - The preview image paths are configured in the `GESTURE_IMAGES` dictionary in
   `VibeCheck.py`.
+- The prototype emote-chain password and timing values are configured in
+  `emote_chain_config.py`.
 - Camera permissions may need to be enabled in your operating system before
   OpenCV can access the webcam.

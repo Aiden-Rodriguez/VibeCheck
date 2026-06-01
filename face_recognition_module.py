@@ -17,12 +17,23 @@ KNOWN_FACES_DIR = "known_faces"   # folder of reference images
 TOLERANCE       = 0.55            # lower = stricter
 CHECK_EVERY_N   = 5               # skip N-1 frames between recognition runs
 SCALE           = 0.5             # downscale factor for detection (speed)
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
 _GREEN = (50, 220, 60)
 _RED   = (40, 50, 245)
 
 
 # Load known faces
+
+def known_face_image_paths(directory: str):
+    for fname in sorted(os.listdir(directory)):
+        if fname.lower().endswith(IMAGE_EXTENSIONS):
+            yield fname, os.path.join(directory, fname)
+
+
+def display_name_from_filename(filename: str):
+    return os.path.splitext(filename)[0].replace("_", " ").title()
+
 
 def load_known_faces(directory: str = KNOWN_FACES_DIR):
     encodings, names = [], []
@@ -36,14 +47,11 @@ def load_known_faces(directory: str = KNOWN_FACES_DIR):
         print(f"         known_faces/yourname.jpg")
         return encodings, names
 
-    for fname in sorted(os.listdir(directory)):
-        if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
-            continue
-        path = os.path.join(directory, fname)
+    for fname, path in known_face_image_paths(directory):
         img  = face_recognition.load_image_file(path)
         encs = face_recognition.face_encodings(img)
         if encs:
-            name = os.path.splitext(fname)[0].replace("_", " ").title()
+            name = display_name_from_filename(fname)
             encodings.append(encs[0])
             names.append(name)
             print(f"[INFO] Loaded face: {name}  ({fname})")
