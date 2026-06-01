@@ -109,6 +109,7 @@ python VibeCheck.py
 | Key | Action |
 | --- | --- |
 | `c` | Start or reset emote-chain authentication |
+| `r` | Randomize the emote-chain password (picks a new 3-step sequence) |
 | `s` | Toggle skeleton/landmark overlays |
 | `e` | Enroll the currently detected face into `known_faces/` |
 | `q` | Quit |
@@ -120,10 +121,20 @@ is configured in `emote_chain_config.py` as:
 Monkey Thinking -> Infinite Void -> Erm
 ```
 
+The `r` key randomizes the password to a fresh 3-step sequence drawn from the
+available gesture set (no consecutive repeats). The new sequence is printed to
+the console and displayed as a breadcrumb inside the on-screen chain panel.
+
 Each step must be matched within 3 seconds and held steadily for 0.5 seconds.
 If the current step is not matched in time, the chain resets to the first emote.
-The on-screen chain panel shows the current target image, detected emote,
-progress, remaining time, and hold progress.
+The on-screen chain panel shows the full password breadcrumb, current target
+image, detected emote, progress, remaining time, and hold progress.
+
+**Face-recognition gate:** when the app is launched with `--face-recognition`,
+the emote-chain will only accept gestures while a *recognized* face (one present
+in `known_faces/`) is visible on camera. If no recognized face is detected, a
+red "FACE NOT RECOGNIZED" warning is drawn and the chain timer is paused until
+a known face appears.
 
 The `s` key toggles all skeleton and landmark debug overlays. The `e`
 enrollment key saves a cropped face image into `known_faces/`. If face
